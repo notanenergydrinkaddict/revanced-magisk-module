@@ -85,7 +85,7 @@ jobs:
             echo "$KEYSTORE_B64" | base64 -d >"$RUNNER_TEMP/microg.keystore"
             KS="$RUNNER_TEMP/microg.keystore" ALIAS="$KEYSTORE_ENTRY_ALIAS" KSPASS="$KEYSTORE_PASSWORD" KPASS="$KEYSTORE_ENTRY_PASSWORD"
           else
-            KS="$GITHUB_WORKSPACE/ks.keystore" ALIAS=jhc KSPASS=123456789 KPASS=123456789
+            KS="$GITHUB_WORKSPACE/ks-p12.keystore" ALIAS=jhc KSPASS=123456789 KPASS=123456789
           fi
           mkdir -p dist
           OUT="dist/$(basename "$UNSIGNED" .apk | sed 's/-unsigned$//').apk"
