@@ -6,11 +6,101 @@ on:
         type: boolean
         required: false
         default: true
+      patches_version:
+        type: string
+        required: false
+        default: latest
 
   workflow_dispatch:
+    inputs:
+      patches_version:
+        description: "morphe-patches release tag to build (latest or a tag like v2.3.0)"
+        type: string
+        required: false
+        default: latest
+
+env:
+  VENDOR_ID: app.software.googletest1
+  ICON_NAME: ic_custom_launcher
+  MICROG_REPO: MorpheApp/MicroG-RE
+  MICROG_REF: main
+  PATCHES_REPO: MorpheApp/morphe-patches
 
 jobs:
+  microg:
+    runs-on: ubuntu-latest
+    env:
+      GRADLE_MICROG_VERSION_WITHOUT_GIT: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Clone MicroG-RE
+        run: git clone --depth 1 --branch "$MICROG_REF" "https://github.com/${MICROG_REPO}.git" microg
+
+      - name: Rename package and launcher icon
+        working-directory: microg
+        run: |
+          set -euo pipefail
+          edit() {
+            local file=$1; shift
+            sed -i "$@" "$file"
+            if git diff --quiet -- "$file"; then echo "::error::nothing changed in $file"; exit 1; fi
+          }
+          edit build.gradle "s/ext.basePackageName = \"app.revanced\"/ext.basePackageName = \"${VENDOR_ID}\"/"
+          edit play-services-core/src/main/AndroidManifest.xml "s/android:name=\"app.revanced.android.gms.SPOOFED_PACKAGE_SIGNATURE\"/android:name=\"\${basePackageName}.android.gms.SPOOFED_PACKAGE_SIGNATURE\"/"
+          edit play-services-core/src/main/res/xml/backup_rules.xml "s/app\.revanced\.android\.gms_preferences\.xml/${VENDOR_ID}.android.gms_preferences.xml/"
+          edit play-services-core/src/main/res/xml/data_extraction_rules.xml "s/app\.revanced\.android\.gms_preferences\.xml/${VENDOR_ID}.android.gms_preferences.xml/"
+          edit play-services-core/src/main/res/xml/credentials_provider_google_id.xml "s/app\.revanced\.android\.libraries/${VENDOR_ID}.android.libraries/"
+          edit play-services-base/core/src/main/kotlin/org/microg/gms/utils/AppPatcherDetector.kt "s/^\(\s*\)\"app\.revanced\.android\.gms\",/\1\"app.revanced.android.gms\",\n\1\"${VENDOR_ID}.android.gms\",/"
+
+          find play-services-core/src/main/res -name 'ic_launcher*' | while read -r f; do
+            mv "$f" "$(dirname "$f")/$(basename "$f" | sed "s/^ic_launcher/${ICON_NAME}/")"
+          done
+          grep -rIl 'ic_launcher' . --exclude-dir=.git | xargs sed -i "s/ic_launcher/${ICON_NAME}/g"
+          if grep -rIq 'ic_launcher' . --exclude-dir=.git; then echo "::error::ic_launcher references remain"; exit 1; fi
+          test -f "play-services-core/src/main/res/mipmap-anydpi-v26/${ICON_NAME}.xml"
+          git status --short | wc -l
+
+      - name: Build
+        working-directory: microg
+        run: ./gradlew --no-daemon :play-services-core:assembleDefaultRelease
+
+      - name: Sign
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_ENTRY_ALIAS: ${{ secrets.KEYSTORE_ENTRY_ALIAS }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEYSTORE_ENTRY_PASSWORD: ${{ secrets.KEYSTORE_ENTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          UNSIGNED=$(ls microg/play-services-core/build/outputs/apk/default/release/*.apk | head -1)
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d >"$RUNNER_TEMP/microg.keystore"
+            KS="$RUNNER_TEMP/microg.keystore" ALIAS="$KEYSTORE_ENTRY_ALIAS" KSPASS="$KEYSTORE_PASSWORD" KPASS="$KEYSTORE_ENTRY_PASSWORD"
+          else
+            KS="$GITHUB_WORKSPACE/ks.keystore" ALIAS=jhc KSPASS=123456789 KPASS=123456789
+          fi
+          mkdir -p dist
+          OUT="dist/$(basename "$UNSIGNED" .apk | sed 's/-unsigned$//').apk"
+          "$BT/zipalign" -p -f 4 "$UNSIGNED" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign --ks "$KS" --ks-key-alias "$ALIAS" --ks-pass "pass:$KSPASS" --key-pass "pass:$KPASS" --out "$OUT" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify "$OUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: microg-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
   run:
+    needs: microg
     permissions: write-all
     runs-on: ubuntu-latest
     steps:
@@ -45,12 +135,51 @@ jobs:
           if [ -z "$TAG" ]; then TAG=0; fi
           echo "NEXT_VER_CODE=$((TAG + 1))" >> $GITHUB_OUTPUT
 
+      - name: Build patches with the new GmsCore vendor id
+        env:
+          PATCHES_VERSION: ${{ inputs.patches_version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GPR_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          TAG=${PATCHES_VERSION:-latest}
+          if [ "$TAG" = "latest" ]; then TAG=$(gh api "repos/${PATCHES_REPO}/releases/latest" --jq .tag_name); fi
+          echo "PATCHES_TAG=$TAG" >>"$GITHUB_ENV"
+          SRC="$RUNNER_TEMP/morphe-patches"
+          git clone --depth 1 --branch "$TAG" "https://github.com/${PATCHES_REPO}.git" "$SRC"
+          cd "$SRC"
+          edit() {
+            local file=$1; shift
+            sed -i "$@" "$file"
+            if git diff --quiet -- "$file"; then echo "::error::nothing changed in $file"; exit 1; fi
+          }
+          edit extensions/shared-youtube/library/src/main/java/app/morphe/extension/shared/patches/GmsCoreSupportPatch.java "s/case \"app.revanced\" ->/case \"${VENDOR_ID}\" ->/; s/return \"app.revanced\";/return \"${VENDOR_ID}\";/"
+          edit patches/src/main/kotlin/app/morphe/patches/shared/misc/gms/GmsCoreSupportPatch.kt "s/^internal const val GMS_CORE_VENDOR_GROUP_ID = \"app.revanced\"/internal const val GMS_CORE_VENDOR_GROUP_ID = \"${VENDOR_ID}\"/"
+          ./gradlew :patches:buildAndroid --no-daemon --console=plain
+          BUILT=$(find patches/build/libs -maxdepth 1 -name 'patches-*.mpp' ! -name '*sources*' ! -name '*javadoc*' | head -1)
+          test -n "$BUILT"
+          OWNER=${PATCHES_REPO%/*}
+          DEST="$GITHUB_WORKSPACE/temp/${OWNER,,}-rv"
+          mkdir -p "$DEST"
+          cp "$BUILT" "$DEST/patches-${TAG#v}.mpp"
+
       - name: Build modules/APKs
         run: if [ -f "config.json" ]; then ./build.sh config.json; else ./build.sh config.toml; fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: $GITHUB_REPOSITORY
           NEXT_VER_CODE: ${{ steps.next_ver_code.outputs.NEXT_VER_CODE }}
+
+      - name: Add MicroG and patches info
+        run: |
+          echo "Patches: ${PATCHES_REPO}/patches-${PATCHES_TAG#v}.mpp  " >>build.md
+          sed -i "s#\[Microg\](https://github.com/MorpheApp/MicroG-RE/)#[Microg](https://github.com/${GITHUB_REPOSITORY}/releases/latest)#" build.md
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: microg-apk
+          path: build
 
       - name: Get output
         id: get_output
